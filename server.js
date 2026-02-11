@@ -49,6 +49,7 @@ function renderTemplate(title, content) {
 	.replace("{{author}}", AUTHOR)
 	.replace("{{copydate}}", COPYDATE)
         .replace("{{title}}", title)
+	.replace("{{nav}}", buildNav())
         .replace("{{content}}", content);
 }
 
@@ -113,6 +114,21 @@ function buildPage(route, filePath) {
     });
 
     return fullHtml;
+}
+
+
+function buildNav() {
+    const navFile = path.join(__dirname, "nav.md");
+
+    if (!fs.existsSync(navFile)) return "";
+
+    try {
+        const md = fs.readFileSync(navFile, "utf8");
+        const html = marked.parse(md);
+        return html;
+    } catch {
+        return "";
+    }
 }
 
 // ----------------------------
