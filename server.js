@@ -2,8 +2,8 @@
 // Configuration
 // ----------------------------
 const SITE_NAME = "My Web Site";
-const AUTHOR = "Chris Northcott"
-const COPYDATE = new Date().getFullYear().toString()
+const AUTHOR = "Chris Northcott";
+const COPYDATE = new Date().getFullYear().toString();
 
 // ----------------------------
 // Imports
@@ -13,6 +13,13 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { marked } = require("marked");
+const sanitizeHtml = require("sanitize-html");
+
+// Disable risky markdown features
+marked.setOptions({
+    headerIds: false,
+    mangle: false
+});
 
 // ----------------------------
 // Port derivation
@@ -36,7 +43,7 @@ const template = fs.readFileSync(templatePath, "utf8");
 
 // ----------------------------
 // Cache
-// Map: route → { hash, html }
+// Map: route → { hash, html, etag }
 // ----------------------------
 const pageCache = new Map();
 
@@ -45,12 +52,12 @@ const pageCache = new Map();
 // ----------------------------
 function renderTemplate(title, content) {
     return template
-	.replace("{{site}}", SITE_NAME)
-	.replace("{{author}}", AUTHOR)
-	.replace("{{copydate}}", COPYDATE)
-        .replace("{{title}}", title)
-	.replace("{{nav}}", buildNav())
-        .replace("{{content}}", content);
+        .replaceAll("{{site}}", SITE_NAME)
+        .replaceAll("{{author}}", AUTHOR)
+        .replaceAll("{{copydate}}", COPYDATE)
+        .replaceAll("{{title}}", title)
+        .replaceAll("{{nav}}", buildNav())
+        .replaceAll("{{content}}", content);
 }
 
 function hashContent(content) {
@@ -85,37 +92,55 @@ function sanitiseUrl(urlPath) {
 
 function routeToFile(cleanPath) {
     const name = cleanPath === "/" ? "index" : cleanPath.slice(1);
-    const file = path.join(pagesDir, name + ".md");
+    const candidate = path.resolve(pagesDir, name + ".md");
 
-    // enforce directory boundary
-    if (!file.startsWith(pagesDir)) {
+    const relative = path.relative(pagesDir, candidate);
+
+    // If it escapes the directory, relative will start with ".."
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
         return null;
     }
 
-    return file;
+    return candidate;
 }
 
 function buildPage(route, filePath) {
     const md = fs.readFileSync(filePath, "utf8");
-    const newHash = hashContent(md);
+    const contentHash = hashContent(md);
 
     const cached = pageCache.get(route);
-    if (cached && cached.hash === newHash) {
-        return cached.html;
+    if (cached && cached.hash === contentHash) {
+        return cached;
     }
 
-    const htmlBody = marked.parse(md);
+    // Render markdown
+    const rawHtml = marked.parse(md);
+
+    // Sanitize output (removes scripts, event handlers, etc.)
+    const htmlBody = sanitizeHtml(rawHtml, {
+        allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+            "img", "h1", "h2", "h3", "pre", "code"
+        ]),
+        allowedAttributes: {
+            a: ["href", "name", "target"],
+            img: ["src", "alt"]
+        }
+    });
+
     const title = route === "/" ? "index" : route.slice(1);
     const fullHtml = renderTemplate(title, htmlBody);
 
-    pageCache.set(route, {
-        hash: newHash,
+    const etag = `"${hashContent(fullHtml)}"`;
+
+    const result = {
+        hash: contentHash,
         html: fullHtml,
-    });
+        etag: etag
+    };
 
-    return fullHtml;
+    pageCache.set(route, result);
+    return result;
 }
-
 
 function buildNav() {
     const navFile = path.join(__dirname, "nav.md");
@@ -124,8 +149,14 @@ function buildNav() {
 
     try {
         const md = fs.readFileSync(navFile, "utf8");
-        const html = marked.parse(md);
-        return html;
+        const rawHtml = marked.parse(md);
+
+        return sanitizeHtml(rawHtml, {
+            allowedTags: sanitizeHtml.defaults.allowedTags,
+            allowedAttributes: {
+                a: ["href", "name", "target"]
+            }
+        });
     } catch {
         return "";
     }
@@ -135,8 +166,9 @@ function buildNav() {
 // Server
 // ----------------------------
 const server = http.createServer((req, res) => {
-    if (req.method !== "GET" && req.method !== "POST") {
-        res.writeHead(405);
+    // GET only
+    if (req.method !== "GET") {
+        res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
         return res.end("Method Not Allowed");
     }
 
@@ -158,16 +190,25 @@ const server = http.createServer((req, res) => {
     }
 
     try {
-        const html = buildPage(cleanPath, filePath);
+        const page = buildPage(cleanPath, filePath);
+
+        // ETag check
+        if (req.headers["if-none-match"] === page.etag) {
+            res.writeHead(304);
+            return res.end();
+        }
 
         res.writeHead(200, {
             "Content-Type": "text/html; charset=utf-8",
+            "ETag": page.etag,
+            "Cache-Control": "public, max-age=0, must-revalidate",
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "DENY",
             "Referrer-Policy": "no-referrer",
+	    "Content-Security-Policy": "default-src 'self'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
         });
 
-        res.end(html);
+        res.end(page.html);
     } catch {
         res.writeHead(500);
         res.end("Internal Server Error");
